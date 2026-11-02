@@ -1,0 +1,17 @@
+# Local credentials and private configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local development artifacts
+node_modules/
+dist/
+coverage/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

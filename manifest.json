@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "LinkedIn Repost Filter",
+  "version": "0.1.0",
+  "description": "Find and hide LinkedIn jobs explicitly marked as reposted.",
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/jobs/search-results/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
