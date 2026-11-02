@@ -6,6 +6,7 @@
   let detectedJobIds = new Set();
   let scanRunning = false;
   let cancelRequested = false;
+  let scanController;
   let host;
   let panel;
 
@@ -92,6 +93,68 @@
     }
   }
 
+  async function scanJobResponse(id, signal) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    const timeout = window.setTimeout(abort, 8000);
+    try {
+      const response = await fetch(`/jobs/view/${id}/`, { credentials: "same-origin", signal: controller.signal });
+      if (response.status === 429) return "limited";
+      if (!response.ok || !new RegExp(`^/jobs/view/${id}/?$`).test(new URL(response.url).pathname)) return "unknown";
+
+      const html = await response.text();
+      // LinkedIn streams the job header as HTML inside its response. The first
+      // strong label in that header is the posting age or explicit repost label.
+      const label = html.match(/<strong(?:\s[^>]*)?>\s*([^<]{1,160})\s*<\/strong>/i)?.[1]
+        ?.replace(/&nbsp;|&#160;/gi, " ").trim();
+      if (!label) return "unknown";
+      if (REPOST_LABEL.test(label)) return "reposted";
+      // Only treat a recognised age as a negative result. Other layouts and
+      // languages are checked through LinkedIn's rendered detail pane instead.
+      if (/^(?:(?:over|about|almost|less than)\s+)?\d+\s+(?:minute|hour|day|week|month|year)s?\s+ago$/i.test(label)) return "original";
+      return "unknown";
+    } finally {
+      window.clearTimeout(timeout);
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
+  async function scanResponses(cards) {
+    const results = new Map();
+    let nextIndex = 0;
+    let completed = 0;
+    let limited = false;
+    scanController = new AbortController();
+
+    async function worker() {
+      while (!cancelRequested && !limited && nextIndex < cards.length) {
+        const { id } = cards[nextIndex++];
+        try {
+          const result = await scanJobResponse(id, scanController.signal);
+          if (result === "limited") {
+            limited = true;
+            scanController.abort();
+          } else if (result !== "unknown") {
+            results.set(id, result);
+          }
+        } catch {
+          // A failed or aborted request will be checked in the detail pane.
+        }
+        completed += 1;
+        if (!cancelRequested) setStatus(`Checking jobs: ${completed} of ${cards.length}…`);
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(6, cards.length) }, worker));
+    } finally {
+      scanController = null;
+    }
+    return results;
+  }
+
   async function scanPage() {
     if (scanRunning) return;
     const cards = getCards();
@@ -105,22 +168,31 @@
     detectedJobIds = new Set();
     const originalJobId = currentJobId();
     const scrollPositions = getScrollPositions();
+    let incomplete = false;
     setControls({ scanning: true, found: 0 });
     setStatus(`Scanning 0 of ${cards.length} loaded jobs…`);
 
     try {
-      for (let index = 0; index < cards.length; index += 1) {
+      const results = await scanResponses(cards);
+      for (const [id, result] of results) {
+        if (result === "reposted") detectedJobIds.add(id);
+      }
+      const remaining = cards.filter(({ id }) => !results.has(id));
+      for (let index = 0; index < remaining.length; index += 1) {
         if (cancelRequested) break;
-        const { id } = cards[index];
+        const { id } = remaining[index];
         const card = findCard(id);
-        if (!card) continue;
+        if (!card) {
+          incomplete = true;
+          continue;
+        }
 
-        setStatus(`Scanning ${index + 1} of ${cards.length}: ${cards[index].title}`);
+        setStatus(`Checking remaining ${index + 1} of ${remaining.length}: ${remaining[index].title}`);
         if (currentJobId() !== id) {
           card.click();
           const selected = await waitForSelection(id);
           if (!selected) {
-            setStatus(`Could not inspect this job; stopped at ${index + 1} of ${cards.length}.`);
+            incomplete = true;
             break;
           }
           // Let LinkedIn finish rendering the selected job details before reading them.
@@ -140,6 +212,8 @@
       setControls();
       if (cancelRequested) {
         setStatus(`Scan stopped. Found ${detectedJobIds.size} repost${detectedJobIds.size === 1 ? "" : "s"}.`);
+      } else if (incomplete) {
+        setStatus(`Scan incomplete. Found ${detectedJobIds.size} reposts; some jobs could not be checked.`);
       } else {
         setStatus(`Found ${detectedJobIds.size} repost${detectedJobIds.size === 1 ? "" : "s"}. Review the count, then choose Hide.`);
       }
@@ -147,12 +221,17 @@
   }
 
   function hideReposts() {
+    const selectedJobId = currentJobId();
     for (const id of detectedJobIds) {
       const card = findCard(id);
       if (!card) continue;
       card.dataset.repostFilterHidden = "true";
       card.style.setProperty("display", "none", "important");
       hiddenJobIds.add(id);
+    }
+    if (selectedJobId && hiddenJobIds.has(selectedJobId)) {
+      const nextVisibleCard = getCards().find(({ id }) => !hiddenJobIds.has(id));
+      if (nextVisibleCard) findCard(nextVisibleCard.id)?.click();
     }
     setControls();
     setStatus(`Hidden ${hiddenJobIds.size} repost${hiddenJobIds.size === 1 ? "" : "s"}. Choose Show to restore them.`);
@@ -179,8 +258,12 @@
     shadow.innerHTML = `
       <style>
         :host { all: initial; }
+        :host([hidden]) { display: none !important; }
         .panel { width: 270px; padding: 14px; color: #191919; background: #fff; border: 1px solid #d6d6d6; border-radius: 12px; box-shadow: 0 4px 18px #0003; font: 14px/1.4 Arial, sans-serif; }
-        .title { margin: 0 0 10px; font-size: 15px; font-weight: 700; }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .title { margin: 0; font-size: 15px; font-weight: 700; }
+        .close { width: 28px; height: 28px; padding: 0; border-radius: 50%; background: transparent; color: #555; font-size: 21px; line-height: 1; }
+        .close:hover { background: #eef3f8; }
         .status { min-height: 36px; margin: 0 0 10px; color: #555; overflow-wrap: anywhere; }
         .actions { display: flex; flex-wrap: wrap; gap: 7px; }
         button { border: 0; border-radius: 18px; padding: 8px 12px; background: #0a66c2; color: white; font-weight: 700; cursor: pointer; }
@@ -190,7 +273,10 @@
         .cancel.visible { display: inline-block; }
       </style>
       <section class="panel" aria-label="LinkedIn Repost Filter">
-        <h2 class="title">Repost Filter</h2>
+        <div class="header">
+          <h2 class="title">Repost Filter</h2>
+          <button class="close" data-action="close" type="button" aria-label="Close Repost Filter" title="Close">×</button>
+        </div>
         <p class="status" data-role="status">Scan loaded jobs for LinkedIn’s repost label.</p>
         <div class="actions">
           <button data-action="scan" type="button">Scan this page</button>
@@ -200,11 +286,15 @@
         <button class="cancel" data-action="cancel" type="button">Cancel scan</button>
       </section>`;
     panel = shadow;
+    shadow.querySelector('[data-action="close"]').addEventListener("click", () => {
+      host.hidden = true;
+    });
     shadow.querySelector('[data-action="scan"]').addEventListener("click", scanPage);
     shadow.querySelector('[data-action="hide"]').addEventListener("click", hideReposts);
     shadow.querySelector('[data-action="show"]').addEventListener("click", showHidden);
     shadow.querySelector('[data-action="cancel"]').addEventListener("click", () => {
       cancelRequested = true;
+      scanController?.abort();
       setStatus("Stopping scan after the current job…");
     });
     document.documentElement.append(host);
@@ -212,6 +302,17 @@
   }
 
   mountPanel();
+  const extensionApi = globalThis.browser ?? globalThis.chrome;
+  extensionApi?.runtime?.onMessage?.addListener((message) => {
+    if (message?.type !== "toggleRepostPanel") return;
+    if (!host?.isConnected) {
+      mountPanel();
+      host.hidden = false;
+      return;
+    }
+    host.hidden = !host.hidden;
+  });
+
   const pageObserver = new MutationObserver(() => {
     if (!host?.isConnected) mountPanel();
   });

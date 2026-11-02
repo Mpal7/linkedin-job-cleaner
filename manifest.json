@@ -3,6 +3,11 @@
   "name": "LinkedIn Repost Filter",
   "version": "0.1.0",
   "description": "Find and hide LinkedIn jobs explicitly marked as reposted.",
+  "permissions": ["activeTab"],
+  "action": {
+    "default_title": "Toggle Repost Filter",
+    "default_popup": "src/toggle.html"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.linkedin.com/jobs/search-results/*"],
